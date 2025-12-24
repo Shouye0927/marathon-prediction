@@ -17,7 +17,7 @@ st.set_page_config(page_title="馬拉松完賽預測 - 國際氣象版", layout=
 st.title("🏃‍♂️ 國際氣象版：馬拉松完賽時間預測系統")
 st.markdown("""
 本系統結合 **WeatherAPI 即時預報**、**個人屬性**與 **Random Forest 模型**。
-輸入前 10 公里 (Sector 1 & 2) 的表現及性別組別，系統將預測最終完賽時間。
+系統會根據歷史參賽數據自動偵測您的配速是否合理，並結合氣象預測最終完賽時間。
 """)
 
 def format_time(seconds):
@@ -54,16 +54,33 @@ def get_global_weather(target_date):
     except:
         return None, False
 
-# --- 3. 載入資料 ---
+# --- 3. 載入資料與統計基準 ---
 @st.cache_data
-def load_data():
+def load_data_and_stats():
     try:
         df = pd.read_csv("final_data.csv")
-        return df
+        # 計算統計基準用於極端值偵測
+        stats = {
+            "s1": {
+                "p1": df['sector1'].quantile(0.01),
+                "p99": df['sector1'].quantile(0.99),
+                "min": df['sector1'].min(),
+                "max": df['sector1'].max(),
+                "median": df['sector1'].median()
+            },
+            "s2": {
+                "p1": df['sector2'].quantile(0.01),
+                "p99": df['sector2'].quantile(0.99),
+                "min": df['sector2'].min(),
+                "max": df['sector2'].max(),
+                "median": df['sector2'].median()
+            }
+        }
+        return df, stats
     except:
-        return None
+        return None, None
 
-df = load_data()
+df, data_stats = load_data_and_stats()
 
 if df is not None:
     # --- 側邊欄輸入 ---
@@ -72,7 +89,7 @@ if df is not None:
     
     # 性別與年齡組別選擇
     gender_age_cols = [col for col in df.columns if 'gender_age_interaction_' in col]
-    gender_age_options = [c.replace('gender_age_interaction_', '') for c in gender_age_cols]
+    gender_age_options = sorted([c.replace('gender_age_interaction_', '') for c in gender_age_cols])
     selected_ga = st.sidebar.selectbox("性別年齡組別", gender_age_options)
 
     weather_info, success = get_global_weather(run_date)
@@ -80,7 +97,7 @@ if df is not None:
     final_weather_inputs = {}
     with st.sidebar.expander("☁️ 氣象數據 (自動同步預報)", expanded=True):
         if success:
-            st.success("✅ 成功同步台南預報數據")
+            st.success("✅ 成功同步預報數據")
         else:
             st.warning("⚠️ 無法獲取預報，請手動確認數值")
 
@@ -99,8 +116,9 @@ if df is not None:
                 final_weather_inputs[f'humidity{h_str}'] = val_h
 
     st.sidebar.subheader("🏃‍♂️ 配速表現")
-    s1_total = st.sidebar.number_input("Sector 1 (5K) 總秒數", value=1500)
-    s2_total = st.sidebar.number_input("Sector 2 (10K) 總秒數", value=1560)
+    # 預設值使用資料集的中位數
+    s1_total = st.sidebar.number_input("Sector 1 (5K) 總秒數", value=int(data_stats['s1']['median']))
+    s2_total = st.sidebar.number_input("Sector 2 (10K) 總秒數", value=int(data_stats['s2']['median']))
 
     # --- 4. 訓練與模型效能分析 ---
     @st.cache_resource
@@ -120,17 +138,24 @@ if df is not None:
 
     rf_model, model_features, model_metrics = train_model_and_get_metrics()
 
-    # --- 5. 執行預測與極端值檢查 ---
+    # --- 5. 執行預測與動態極端值檢查 ---
     if st.sidebar.button("🚀 開始預測"):
-        # 極端值提示檢查邏輯
+        # 動態偵測極端值警告
         warnings = []
-        if s1_total < 750 or s2_total < 750: # 快於 2:30/km
-            warnings.append("🚨 **警告**：輸入配速接近或超越世界紀錄，預測結果可能失真。")
-        if s1_total > 3600 or s2_total > 3600: # 慢於 12:00/km
-            warnings.append("ℹ️ **提示**：配速較接近步行速度，模型可能無法精確捕捉長跑動能變化。")
-        if abs(s2_total - s1_total) > 300: # 兩段 5K 差超過 5 分鐘
-            warnings.append("⚠️ **提示**：前兩段配速波動較大（超過 5 分鐘），建議檢查輸入數值是否正確。")
+        
+        # Sector 1 檢查
+        if s1_total < data_stats['s1']['p1']:
+            warnings.append(f"🚨 **速度極快**：您的 Sector 1 表現優於 99% 的歷史數據 (歷史最快: {format_time(data_stats['s1']['min'])})。")
+        elif s1_total > data_stats['s1']['p99']:
+            warnings.append(f"ℹ️ **速度較慢**：您的 Sector 1 表現慢於 99% 的歷史數據 (歷史最慢: {format_time(data_stats['s1']['max'])})。")
+            
+        # Sector 2 檢查
+        if s2_total < data_stats['s2']['p1']:
+            warnings.append(f"🚨 **速度極快**：您的 Sector 2 表現優於 99% 的歷史數據 (歷史最快: {format_time(data_stats['s2']['min'])})。")
+        elif s2_total > data_stats['s2']['p99']:
+            warnings.append(f"ℹ️ **速度較慢**：您的 Sector 2 表現慢於 99% 的歷史數據 (歷史最慢: {format_time(data_stats['s2']['max'])})。")
 
+        # 準備輸入特徵
         input_row = pd.DataFrame(0, index=[0], columns=model_features)
         for k, v in final_weather_inputs.items():
             if k in input_row.columns: input_row[k] = v
@@ -141,13 +166,14 @@ if df is not None:
         ga_col = f'gender_age_interaction_{selected_ga}'
         if ga_col in input_row.columns: input_row[ga_col] = 1
         
+        # 模型預測與不確定性
         pred = rf_model.predict(input_row)[0]
         all_tree_preds = np.array([tree.predict(input_row.values) for tree in rf_model.estimators_])
         std_dev = np.std(all_tree_preds)
 
         st.balloons()
         
-        # 顯示極端值警示
+        # 顯示警示
         for msg in warnings:
             st.warning(msg)
 
@@ -162,14 +188,17 @@ if df is not None:
             st.write(f"Sector 1 (5K): {format_time(s1_total)}")
             st.write(f"Sector 2 (10K): {format_time(s2_total)}")
             st.write(f"兩段落秒差: {s2_total - s1_total} 秒")
+            if abs(s2_total - s1_total) > 300:
+                st.warning("⚠️ 兩段配速差異較大，可能影響後半程體能預測。")
 
     # --- 6. 模型效能展示 ---
     st.divider()
-    st.subheader("📊 模型預測準確度評估")
+    st.subheader("📊 模型預測準確度評估 (基於歷史數據)")
     m1, m2, m3 = st.columns(3)
     m1.metric("R² Score (模型解釋力)", f"{model_metrics['R2']:.4f}")
     m2.metric("平均絕對誤差 (MAE)", f"{model_metrics['MAE']:.2f} 秒")
     m3.metric("均方誤差 (MSE)", f"{model_metrics['MSE']:.1f}")
+    st.caption("註：R² 越接近 1 代表模型對數據的擬合度越高。本指標由原始資料集 20% 之測試集計算得出。")
 
 else:
-    st.warning("請確保資料夾中存有 'final_data.csv' 檔案。")
+    st.error("❌ 找不到 'final_data.csv'。請確認檔案已放置於專案根目錄。")
